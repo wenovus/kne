@@ -42,6 +42,7 @@ enum Vendor {
   QUAGGA = 7;
   GOBGP = 8;
   NOKIA = 9;
+  FAKE = 99;
 }
 
 
@@ -61,6 +62,7 @@ message Node {
     IXIA_TG = 10;
     GOBGP = 11;
     CISCO_XRD = 12;
+    FAKE = 99;
   }
 
   string name = 1; // Name of the node in the topology. Must be unique.

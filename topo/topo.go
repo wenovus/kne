@@ -42,6 +42,7 @@ import (
 
 	_ "github.com/google/kne/topo/node/ceos"
 	_ "github.com/google/kne/topo/node/cptx"
+	_ "github.com/google/kne/topo/node/fake"
 	_ "github.com/google/kne/topo/node/gobgp"
 	_ "github.com/google/kne/topo/node/host"
 	_ "github.com/google/kne/topo/node/ixia"

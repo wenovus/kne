@@ -442,7 +442,7 @@ func getImpl(impl *Impl) (Node, error) {
 	// TODO(hines): Remove once type is deprecated.
 	fn, ok = nodeTypes[impl.Proto.Type]
 	if !ok {
-		return nil, fmt.Errorf("impl not found: %v", impl.Proto.Type)
+		return nil, fmt.Errorf("impl not found: %v in %+v", impl.Proto.Type, nodeTypes)
 	}
 	return fn(impl)
 }

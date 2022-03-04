@@ -44,9 +44,8 @@ func TestNew(t *testing.T) {
 			},
 			Services: map[uint32]*topopb.Service{
 				6030: {
-					Name:     "gnmi",
-					Inside:   6030,
-					NodePort: 30001,
+					Name:   "gnmi",
+					Inside: 6030,
 				},
 			},
 		},
@@ -66,9 +65,8 @@ func TestNew(t *testing.T) {
 			},
 			Services: map[uint32]*topopb.Service{
 				6030: {
-					Name:     "gnmi",
-					Inside:   6030,
-					NodePort: 30002,
+					Name:   "gnmi",
+					Inside: 6030,
 				},
 			},
 		},

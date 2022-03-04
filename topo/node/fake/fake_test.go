@@ -3,12 +3,11 @@ package fake
 import (
 	"testing"
 
-	"google.golang.org/protobuf/encoding/prototext"
-	"google.golang.org/protobuf/proto"
-
+	"github.com/google/go-cmp/cmp"
 	topopb "github.com/google/kne/proto/topo"
 	"github.com/google/kne/topo/node"
 	"github.com/h-fam/errdiff"
+	"google.golang.org/protobuf/testing/protocmp"
 )
 
 func TestNew(t *testing.T) {
@@ -40,7 +39,15 @@ func TestNew(t *testing.T) {
 			Config: &topopb.Config{
 				Image:        "foobar",
 				Command:      []string{"run", "some", "command"},
+				Args:         []string{"-target", "test_node", "-port", "6030"},
 				EntryCommand: "kubectl exec -it test_node -- /bin/bash",
+			},
+			Services: map[uint32]*topopb.Service{
+				6030: {
+					Name:     "gnmi",
+					Inside:   6030,
+					NodePort: 30001,
+				},
 			},
 		},
 	}, {
@@ -55,6 +62,14 @@ func TestNew(t *testing.T) {
 			Config: &topopb.Config{
 				Image:        "wenovus/fakeserver0",
 				EntryCommand: "kubectl exec -it test_node -- /bin/bash",
+				Args:         []string{"-target", "test_node", "-port", "6030"},
+			},
+			Services: map[uint32]*topopb.Service{
+				6030: {
+					Name:     "gnmi",
+					Inside:   6030,
+					NodePort: 30002,
+				},
 			},
 		},
 	}}
@@ -67,8 +82,8 @@ func TestNew(t *testing.T) {
 			if tt.wantErr != "" {
 				return
 			}
-			if !proto.Equal(impl.GetProto(), tt.wantPB) {
-				t.Fatalf("New() failed: got\n%swant\n%s", prototext.Format(impl.GetProto()), prototext.Format(tt.wantPB))
+			if diff := cmp.Diff(impl.GetProto(), tt.wantPB, protocmp.Transform()); diff != "" {
+				t.Fatalf("New() failed: (-got, +want)%s", diff)
 			}
 		})
 	}

@@ -15,6 +15,7 @@ package fake
 
 import (
 	"fmt"
+	"strconv"
 
 	tpb "github.com/google/kne/proto/topo"
 	"github.com/google/kne/topo/node"
@@ -27,8 +28,8 @@ func New(nodeImpl *node.Impl) (node.Node, error) {
 	if nodeImpl.Proto == nil {
 		return nil, fmt.Errorf("nodeImpl.Proto cannot be nil")
 	}
-	cfg := defaults(nodeImpl.Proto)
-	node.FixServices(cfg)
+	node.FixServices(defaults(nodeImpl.Proto))
+
 	n := &Node{
 		Impl: nodeImpl,
 	}
@@ -48,6 +49,19 @@ func defaults(pb *tpb.Node) *tpb.Node {
 	}
 	if pb.Config.EntryCommand == "" {
 		pb.Config.EntryCommand = fmt.Sprintf("kubectl exec -it %s -- /bin/bash", pb.Name)
+	}
+	pb.Config.Args = append(pb.Config.Args, "-target", pb.Name)
+	const gnmiPort = 6030
+	pb.Config.Args = append(pb.Config.Args, "-port", strconv.Itoa(gnmiPort))
+
+	if pb.Services == nil {
+		pb.Services = map[uint32]*tpb.Service{
+			gnmiPort: {
+				Name:     "gnmi",
+				Inside:   gnmiPort,
+				NodePort: node.GetNextPort(),
+			},
+		}
 	}
 	return pb
 }

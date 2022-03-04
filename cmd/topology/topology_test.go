@@ -12,26 +12,32 @@ import (
 	"testing"
 
 	tfake "github.com/google/kne/api/clientset/v1beta1/fake"
+	cpb "github.com/google/kne/proto/controller"
+	tpb "github.com/google/kne/proto/topo"
 	"github.com/google/kne/topo"
 	"github.com/google/kne/topo/node"
 	"github.com/h-fam/errdiff"
 	"google.golang.org/protobuf/encoding/prototext"
 	"google.golang.org/protobuf/proto"
-	corev1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/util/intstr"
 	kfake "k8s.io/client-go/kubernetes/fake"
 	"k8s.io/client-go/rest"
-
-	tpb "github.com/google/kne/proto/topo"
 )
 
+func NewNC(impl *node.Impl) (node.Node, error) {
+	return &notConfigable{Impl: impl}, nil
+}
+
+type notConfigable struct {
+	*node.Impl
+	configPushErr error
+}
+
 func NewNR(impl *node.Impl) (node.Node, error) {
-	return &notResettable{Impl: impl}, nil
+	return &notResettable{&notConfigable{Impl: impl}}, nil
 }
 
 type notResettable struct {
-	*node.Impl
-	configPushErr error
+	*notConfigable
 }
 
 func (nr *notResettable) ConfigPush(_ context.Context, r io.Reader) error {
@@ -54,7 +60,7 @@ func (r *resettable) ResetCfg(ctx context.Context) error {
 }
 
 func NewR(impl *node.Impl) (node.Node, error) {
-	return &resettable{&notResettable{Impl: impl}}, nil
+	return &resettable{&notResettable{&notConfigable{Impl: impl}}}, nil
 }
 
 func writeTopology(t *testing.T, topo *tpb.Topology) (*os.File, func()) {
@@ -241,20 +247,6 @@ func TestReset(t *testing.T) {
 	}
 }
 
-type fakeTopology struct {
-	resources *topo.Resources
-	rErr      error
-	lErr      error
-}
-
-func (f *fakeTopology) Load(context.Context) error {
-	return f.lErr
-}
-
-func (f *fakeTopology) Resources(context.Context) (*topo.Resources, error) {
-	return f.resources, f.rErr
-}
-
 var (
 	validPbTxt = `
 name: "test-data-topology"
@@ -331,146 +323,61 @@ links: {
   a_int: "eth9"
   z_node: "ate2"
   z_int: "eth1"
-}	
+}
 `
 )
 
 func TestService(t *testing.T) {
-	sCmd := New()
-	origOpts := opts
-	defer func() {
-		opts = origOpts
-	}()
-	sCmd.PersistentFlags().String("kubecfg", "", "")
-	buf := bytes.NewBuffer([]byte{})
-	sCmd.SetOut(buf)
-	validTopoOut := &tpb.Topology{}
-	if err := prototext.Unmarshal([]byte(validPbTxt), validTopoOut); err != nil {
-		t.Fatalf("cannot Unmarshal validTopo: %v", err)
+	validProto := &tpb.Topology{}
+	if err := prototext.Unmarshal([]byte(validPbTxt), validProto); err != nil {
+		t.Fatalf("failed to build a valid Topology protobuf for testing: %v", err)
 	}
 	tests := []struct {
-		desc    string
-		args    []string
-		tFile   string
-		want    *tpb.Topology
-		wantErr string
-		topoNew func(string, *tpb.Topology, ...topo.Option) (resourcer, error)
-	}{{
-		desc:    "no args",
-		wantErr: "missing topology",
-		args:    []string{"service"},
-	}, {
-		desc:    "empty resources",
-		wantErr: "not found",
-		args:    []string{"service", "testdata/valid_topo.pb.txt"},
-		topoNew: func(string, *tpb.Topology, ...topo.Option) (resourcer, error) {
-			return &fakeTopology{
-				resources: &topo.Resources{},
-			}, nil
+		desc                string
+		args                []string
+		getTopologyServices func(ctx context.Context, params topo.TopologyParams) (*cpb.ShowTopologyResponse, error)
+		want                *tpb.Topology
+		wantErr             string
+	}{
+		{
+			desc:    "no args",
+			wantErr: "missing topology",
+			args:    []string{"service"},
+		}, {
+			desc: "fail to get topology service",
+			getTopologyServices: func(context.Context, topo.TopologyParams) (*cpb.ShowTopologyResponse, error) {
+				return &cpb.ShowTopologyResponse{
+					State: cpb.TopologyState_TOPOLOGY_STATE_ERROR,
+				}, fmt.Errorf("some error")
+			},
+			wantErr: "some error",
+			args:    []string{"service", "testdata/valid_topo.pb.txt"},
+		}, {
+			desc: "valid case",
+			getTopologyServices: func(context.Context, topo.TopologyParams) (*cpb.ShowTopologyResponse, error) {
+				return &cpb.ShowTopologyResponse{
+					State:    cpb.TopologyState_TOPOLOGY_STATE_RUNNING,
+					Topology: validProto,
+				}, nil
+			},
+			want: validProto,
+			args: []string{"service", "testdata/valid_topo.pb.txt"},
 		},
-	}, {
-		desc:    "Load fail",
-		wantErr: "load failed",
-		args:    []string{"service", "testdata/valid_topo.pb.txt"},
-		topoNew: func(string, *tpb.Topology, ...topo.Option) (resourcer, error) {
-			return &fakeTopology{
-				lErr:      fmt.Errorf("load failed"),
-				resources: &topo.Resources{},
-			}, nil
-		},
-	}, {
-		desc: "newTopo valid",
-		args: []string{"service", "testdata/valid_topo.pb.txt"},
-		want: validTopoOut,
-		topoNew: func(string, *tpb.Topology, ...topo.Option) (resourcer, error) {
-			return &fakeTopology{
-				resources: &topo.Resources{
-					Services: map[string]*corev1.Service{
-						"gnmi-service": {
-							Spec: corev1.ServiceSpec{
-								ClusterIP: "1.1.1.1",
-								Ports: []corev1.ServicePort{{
-									Port:     1000,
-									NodePort: 20000,
-									Name:     "gnmi",
-								}},
-							},
-							Status: corev1.ServiceStatus{
-								LoadBalancer: corev1.LoadBalancerStatus{
-									Ingress: []corev1.LoadBalancerIngress{{IP: "100.100.100.100"}},
-								},
-							},
-						},
-						"grpc-service": {
-							Spec: corev1.ServiceSpec{
-								ClusterIP: "1.1.1.1",
-								Ports: []corev1.ServicePort{{
-									Port:     1001,
-									NodePort: 20001,
-									Name:     "grpc",
-								}},
-							},
-							Status: corev1.ServiceStatus{
-								LoadBalancer: corev1.LoadBalancerStatus{
-									Ingress: []corev1.LoadBalancerIngress{{IP: "100.100.100.100"}},
-								},
-							},
-						},
-						"service-r1": {
-							Spec: corev1.ServiceSpec{
-								ClusterIP: "1.1.1.2",
-								Ports: []corev1.ServicePort{{
-									Port:       1002,
-									NodePort:   22,
-									Name:       "ssh",
-									TargetPort: intstr.IntOrString{IntVal: 22},
-								}},
-							},
-							Status: corev1.ServiceStatus{
-								LoadBalancer: corev1.LoadBalancerStatus{
-									Ingress: []corev1.LoadBalancerIngress{{IP: "100.100.100.101"}},
-								},
-							},
-						},
-						"service-ate1": {
-							Spec: corev1.ServiceSpec{
-								ClusterIP: "1.1.1.3",
-								Ports: []corev1.ServicePort{{
-									Port:       5555,
-									NodePort:   30010,
-									Name:       "port-5555",
-									TargetPort: intstr.IntOrString{IntVal: 5555},
-								}, {
-									Port:       50071,
-									NodePort:   30011,
-									Name:       "port-50071",
-									TargetPort: intstr.IntOrString{IntVal: 50071},
-								}},
-							},
-							Status: corev1.ServiceStatus{
-								LoadBalancer: corev1.LoadBalancerStatus{
-									Ingress: []corev1.LoadBalancerIngress{{IP: "100.100.100.102"}},
-								},
-							},
-						},
-					},
-				},
-			}, nil
-		},
-	}, {
-		desc:    "load topo error",
-		wantErr: "no such file or directory",
-		args:    []string{"service", "dne.txt"},
-	}}
+	}
+
+	sCmd := New()
+	sCmd.PersistentFlags().String("kubecfg", "", "")
 	for _, tt := range tests {
 		t.Run(tt.desc, func(t *testing.T) {
+			origGetTopologyServices := getTopologyServices
+			getTopologyServices = tt.getTopologyServices
+			defer func() {
+				getTopologyServices = origGetTopologyServices
+			}()
 			buf := bytes.NewBuffer([]byte{})
 			sCmd.SetOut(buf)
 			sCmd.SetArgs(tt.args)
-			topoNew = tt.topoNew
-			defer func() {
-				topoNew = defaultNewTopo
-			}()
+
 			err := sCmd.ExecuteContext(context.Background())
 			if s := errdiff.Check(err, tt.wantErr); s != "" {
 				t.Fatalf("serviceCmd failed: %s", s)
@@ -484,6 +391,86 @@ func TestService(t *testing.T) {
 			}
 			if !proto.Equal(got, tt.want) {
 				t.Fatalf("Service failed: got:\n%s\n, want:\n%s\n", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestPush(t *testing.T) {
+	confFile, err := ioutil.TempFile("", "push")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Fprintln(confFile, "some bytes")
+	defer os.Remove(confFile.Name())
+	tWithConfig := &tpb.Topology{
+		Nodes: []*tpb.Node{{
+			Name: "configable",
+			Type: tpb.Node_Type(1003),
+		}, {
+			Name: "notconfigable",
+			Type: tpb.Node_Type(1004),
+		}},
+	}
+	fConfig, closer := writeTopology(t, tWithConfig)
+	defer closer()
+	node.Register(tpb.Node_Type(1003), NewR)
+	node.Register(tpb.Node_Type(1004), NewNC)
+	tests := []struct {
+		desc    string
+		args    []string
+		tFile   string
+		wantErr string
+	}{{
+		desc:    "no args",
+		wantErr: "invalid args",
+		args:    []string{"push"},
+	}, {
+		desc:    "missing args",
+		wantErr: "invalid args",
+		args:    []string{"push", fConfig.Name(), "configable"},
+	}, {
+		desc:    "no file",
+		args:    []string{"push", fConfig.Name(), "configable", "filedne"},
+		wantErr: "no such file",
+	}, {
+		desc:    "valid file invalid device",
+		args:    []string{"push", fConfig.Name(), "foo", confFile.Name()},
+		wantErr: `node "foo" not found`,
+	}, {
+		desc: "valid file notconfigable device",
+		args: []string{"push", fConfig.Name(), "notconfigable", confFile.Name()},
+	}, {
+		desc: "valid file",
+		args: []string{"push", fConfig.Name(), "configable", confFile.Name()},
+	}}
+
+	rCmd := New()
+	origOpts := opts
+	tf, err := tfake.NewSimpleClientset()
+	if err != nil {
+		t.Fatalf("cannot create fake topology clientset")
+	}
+	opts = []topo.Option{
+		topo.WithClusterConfig(&rest.Config{}),
+		topo.WithKubeClient(kfake.NewSimpleClientset()),
+		topo.WithTopoClient(tf),
+	}
+	defer func() {
+		opts = origOpts
+	}()
+	rCmd.PersistentFlags().String("kubecfg", "", "")
+	buf := bytes.NewBuffer([]byte{})
+	rCmd.SetOut(buf)
+	for _, tt := range tests {
+		t.Run(tt.desc, func(t *testing.T) {
+			rCmd.SetArgs(tt.args)
+			err := rCmd.ExecuteContext(context.Background())
+			if s := errdiff.Check(err, tt.wantErr); s != "" {
+				t.Fatalf("pushFn failed: %s", s)
+			}
+			if tt.wantErr != "" {
+				return
 			}
 		})
 	}

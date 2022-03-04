@@ -163,6 +163,10 @@ func TestNew(t *testing.T) {
 			Name: "pod1",
 		}),
 	}, {
+		desc:    "nil pb",
+		ni:      &node.Impl{},
+		wantErr: "nodeImpl.Proto cannot be nil",
+	}, {
 		desc: "full proto",
 		ni: &node.Impl{
 			KubeClient: fake.NewSimpleClientset(),
@@ -176,6 +180,9 @@ func TestNew(t *testing.T) {
 						Data: []byte("config file data"),
 					},
 				},
+				Labels: map[string]string{
+					"type": "foo_test",
+				},
 			},
 		},
 		want: &tpb.Node{
@@ -188,21 +195,18 @@ func TestNew(t *testing.T) {
 				443: {
 					Name:     "ssl",
 					Inside:   443,
-					NodePort: node.GetNextPort(),
 				},
 				22: {
 					Name:     "ssh",
 					Inside:   22,
-					NodePort: node.GetNextPort(),
 				},
 				50051: {
 					Name:     "gnmi",
 					Inside:   50051,
-					NodePort: node.GetNextPort(),
 				},
 			},
 			Labels: map[string]string{
-				"type":   tpb.Node_JUNIPER_CEVO.String(),
+				"type":   "foo_test",
 				"vendor": tpb.Vendor_JUNIPER.String(),
 			},
 			Config: &tpb.Config{
@@ -219,6 +223,49 @@ func TestNew(t *testing.T) {
 				ConfigData: &tpb.Config_Data{
 					Data: []byte("config file data"),
 				},
+			},
+		},
+	}, {
+		desc: "defaults check with empty proto",
+		ni: &node.Impl{
+			KubeClient: fake.NewSimpleClientset(),
+			Namespace:  "test",
+			Proto:      &tpb.Node{},
+		},
+		want: &tpb.Node{
+			Constraints: map[string]string{
+				"cpu":    "8",
+				"memory": "8Gi",
+			},
+			Services: map[uint32]*tpb.Service{
+				443: {
+					Name:     "ssl",
+					Inside:   443,
+				},
+				22: {
+					Name:     "ssh",
+					Inside:   22,
+				},
+				50051: {
+					Name:     "gnmi",
+					Inside:   50051,
+				},
+			},
+			Labels: map[string]string{
+				"type":   tpb.Node_JUNIPER_CEVO.String(),
+				"vendor": tpb.Vendor_JUNIPER.String(),
+			},
+			Config: &tpb.Config{
+				Image: "cptx:latest",
+				Command: []string{
+					"/entrypoint.sh",
+				},
+				Env: map[string]string{
+					"CPTX": "1",
+				},
+				EntryCommand: fmt.Sprintf("kubectl exec -it  -- cli -c"),
+				ConfigPath:   "/home/evo/configdisk",
+				ConfigFile:   "juniper.conf",
 			},
 		},
 	}}

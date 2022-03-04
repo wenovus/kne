@@ -21,14 +21,18 @@ import (
 	"io"
 	"io/ioutil"
 	"sort"
-	"sync"
+	"strings"
 	"time"
 
+	"github.com/ghodss/yaml"
+	"github.com/golang/protobuf/proto"
+	cpb "github.com/google/kne/proto/controller"
 	"github.com/google/kne/topo/node"
 	"github.com/kr/pretty"
 	log "github.com/sirupsen/logrus"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/encoding/prototext"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -41,18 +45,38 @@ import (
 	tpb "github.com/google/kne/proto/topo"
 
 	_ "github.com/google/kne/topo/node/ceos"
+	_ "github.com/google/kne/topo/node/cisco"
 	_ "github.com/google/kne/topo/node/cptx"
 	_ "github.com/google/kne/topo/node/fake"
 	_ "github.com/google/kne/topo/node/gobgp"
 	_ "github.com/google/kne/topo/node/host"
 	_ "github.com/google/kne/topo/node/ixia"
 	_ "github.com/google/kne/topo/node/srl"
-	_ "github.com/google/kne/topo/node/xrd"
 )
+
+var protojsonUnmarshaller = protojson.UnmarshalOptions{
+	AllowPartial:   true,
+	DiscardUnknown: false,
+}
+
+// TopologyManager manages a topology.
+type TopologyManager interface {
+	CheckNodeStatus(context.Context, time.Duration) error
+	ConfigPush(context.Context, string, io.Reader) error
+	Delete(context.Context) error
+	Load(context.Context) error
+	Node(string) (node.Node, error)
+	Nodes() []node.Node
+	Push(context.Context) error
+	Resources(context.Context) (*Resources, error)
+	TopologyProto() *tpb.Topology
+	Watch(context.Context) error
+}
 
 // Manager is a topology instance manager for k8s cluster instance.
 type Manager struct {
 	BasePath string
+	kubecfg  string
 	kClient  kubernetes.Interface
 	tClient  topologyclientv1.Interface
 	rCfg     *rest.Config
@@ -61,6 +85,12 @@ type Manager struct {
 }
 
 type Option func(m *Manager)
+
+func WithTopology(t *tpb.Topology) Option {
+	return func(m *Manager) {
+		m.proto = t
+	}
+}
 
 func WithKubeClient(c kubernetes.Interface) Option {
 	return func(m *Manager) {
@@ -87,18 +117,19 @@ func WithBasePath(s string) Option {
 }
 
 // New creates a new topology manager based on the provided kubecfg and topology.
-func New(kubecfg string, pb *tpb.Topology, opts ...Option) (*Manager, error) {
-	if pb == nil {
-		return nil, fmt.Errorf("pb cannot be nil")
-	}
-	log.Infof("Creating manager for: %s", pb.Name)
+func New(kubecfg string, pb *tpb.Topology, opts ...Option) (TopologyManager, error) {
 	m := &Manager{
-		proto: pb,
-		nodes: map[string]node.Node{},
+		kubecfg: kubecfg,
+		proto:   pb,
+		nodes:   map[string]node.Node{},
 	}
 	for _, o := range opts {
 		o(m)
 	}
+	if m.proto == nil {
+		return nil, fmt.Errorf("topology protobuf cannot be nil")
+	}
+	log.Infof("Creating manager for: %s", m.proto.Name)
 	if m.rCfg == nil {
 		// use the current context in kubeconfig try in-cluster first if not fallback to kubeconfig
 		log.Infof("Trying in-cluster configuration")
@@ -190,7 +221,7 @@ func (m *Manager) Load(ctx context.Context) error {
 	}
 	for k, n := range nMap {
 		log.Infof("Adding Node: %s:%s:%s", n.Name, n.Vendor, n.Type)
-		nn, err := node.New(m.proto.Name, n, m.kClient, m.rCfg, m.BasePath)
+		nn, err := node.New(m.proto.Name, n, m.kClient, m.rCfg, m.BasePath, m.kubecfg)
 		if err != nil {
 			return fmt.Errorf("failed to load topology: %w", err)
 		}
@@ -206,6 +237,11 @@ func (m *Manager) Topology(ctx context.Context) ([]topologyv1.Topology, error) {
 		return nil, fmt.Errorf("failed to get topology CRDs: %v", err)
 	}
 	return topology.Items, nil
+}
+
+// Topology returns the topology protobuf.
+func (m *Manager) TopologyProto() *tpb.Topology {
+	return m.proto
 }
 
 // Push pushes the current topology to k8s.
@@ -351,9 +387,21 @@ func Load(fName string) (*tpb.Topology, error) {
 		return nil, err
 	}
 	t := &tpb.Topology{}
-	if err := prototext.Unmarshal(b, t); err != nil {
-		return nil, err
+
+	if strings.HasSuffix(fName, ".yaml") || strings.HasSuffix(fName, ".yml") {
+		jsonBytes, err := yaml.YAMLToJSON(b)
+		if err != nil {
+			return nil, fmt.Errorf("could not parse yaml: %v", err)
+		}
+		if err := protojsonUnmarshaller.Unmarshal(jsonBytes, t); err != nil {
+			return nil, fmt.Errorf("could not parse json: %v", err)
+		}
+	} else {
+		if err := prototext.Unmarshal(b, t); err != nil {
+			return nil, err
+		}
 	}
+
 	return t, nil
 }
 
@@ -446,15 +494,208 @@ func (m *Manager) Node(nodeName string) (node.Node, error) {
 	return n, nil
 }
 
+// TopologyParams specifies the parameters used by the functions that
+// creates/deletes/show topology.
+type TopologyParams struct {
+	TopoName       string   // the filename of the topology
+	Kubecfg        string   // the path of kube config
+	TopoNewOptions []Option // the options used in the TopoNewFunc
+	Timeout        time.Duration
+	DryRun         bool
+}
+
+// CreateTopology creates the topology and configs it.
+func CreateTopology(ctx context.Context, params TopologyParams) error {
+	var topopb *tpb.Topology
+	var err error
+	if params.TopoName != "" {
+		topopb, err = Load(params.TopoName)
+		if err != nil {
+			return fmt.Errorf("failed to load %s: %+v", params.TopoName, err)
+		}
+	}
+	t, err := New(params.Kubecfg, topopb, params.TopoNewOptions...)
+	if err != nil {
+		return fmt.Errorf("failed to create topology for %s: %+v", params.TopoName, err)
+	}
+	log.Infof("Topology:\n%s\n", proto.MarshalTextString(t.TopologyProto()))
+	if err := t.Load(ctx); err != nil {
+		return fmt.Errorf("failed to load topology: %w", err)
+	}
+	if params.DryRun {
+		return nil
+	}
+
+	if err := t.Push(ctx); err != nil {
+		return err
+	}
+	if err := t.CheckNodeStatus(ctx, params.Timeout); err != nil {
+		return err
+	}
+	log.Infof("Topology %q created\n", t.TopologyProto().GetName())
+	r, err := t.Resources(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to check resource %s: %+v", params.TopoName, err)
+	}
+	log.Infof("Pods:")
+	for _, p := range r.Pods {
+		log.Infof("%s\n", p.Name)
+	}
+
+	return nil
+}
+
+// DeleteTopology deletes the topology.
+func DeleteTopology(ctx context.Context, params TopologyParams) error {
+	var topopb *tpb.Topology
+	var err error
+	if params.TopoName != "" {
+		topopb, err = Load(params.TopoName)
+		if err != nil {
+			return fmt.Errorf("failed to load %s: %+v", params.TopoName, err)
+		}
+	}
+	t, err := New(params.Kubecfg, topopb, params.TopoNewOptions...)
+	if err != nil {
+		return fmt.Errorf("failed to delete topology for %s: %+v", params.TopoName, err)
+	}
+	log.Infof("Topology:\n%+v\n", proto.MarshalTextString(t.TopologyProto()))
+	if err := t.Load(ctx); err != nil {
+		return fmt.Errorf("failed to load %s: %+v", params.TopoName, err)
+	}
+
+	if err := t.Delete(ctx); err != nil {
+		return fmt.Errorf("failed to delete %s: %+v", params.TopoName, err)
+	}
+	log.Infof("Successfully deleted topology: %q", t.TopologyProto().GetName())
+
+	return nil
+}
+
+// serviceToProto creates the service mapping.
+func serviceToProto(s *corev1.Service, m map[uint32]*tpb.Service) error {
+	if s == nil || m == nil {
+		return fmt.Errorf("service and map must not be nil")
+	}
+	if len(s.Status.LoadBalancer.Ingress) == 0 {
+		return fmt.Errorf("service %s has no external loadbalancer configured", s.Name)
+	}
+	for _, p := range s.Spec.Ports {
+		k := uint32(p.Port)
+		service, ok := m[k]
+		if !ok {
+			service = &tpb.Service{
+				Name:   p.Name,
+				Inside: k,
+			}
+			m[k] = service
+		}
+		if service.Name == "" {
+			service.Name = p.Name
+		}
+		service.Outside = uint32(p.TargetPort.IntVal)
+		service.NodePort = uint32(p.NodePort)
+		service.InsideIp = s.Spec.ClusterIP
+		service.OutsideIp = s.Status.LoadBalancer.Ingress[0].IP
+	}
+	return nil
+}
+
 var (
-	muPort   sync.Mutex
-	nextPort uint32 = 30001
+	new = New // a non-public new to allow overriding the New() in this package.
 )
 
-func GetNextPort() uint32 {
-	muPort.Lock()
-	p := nextPort
-	nextPort++
-	muPort.Unlock()
-	return p
+// sMap keeps the POD state of all topology nodes.
+type sMap struct {
+	m map[string]corev1.PodPhase
+}
+
+func (s *sMap) Size() int {
+	return len(s.m)
+}
+
+func (s *sMap) SetNodeState(name string, state corev1.PodPhase) {
+	if s.m == nil {
+		s.m = map[string]corev1.PodPhase{}
+	}
+	s.m[name] = state
+}
+
+func (s *sMap) TopoState() cpb.TopologyState {
+	if s == nil || len(s.m) == 0 {
+		return cpb.TopologyState_TOPOLOGY_STATE_UNKNOWN
+	}
+	cntTable := map[corev1.PodPhase]int{}
+	for _, gotState := range s.m {
+		cntTable[gotState]++
+	}
+
+	if cntTable[corev1.PodRunning] == s.Size() {
+		return cpb.TopologyState_TOPOLOGY_STATE_RUNNING
+	}
+	if cntTable[corev1.PodFailed] > 0 {
+		return cpb.TopologyState_TOPOLOGY_STATE_ERROR
+	}
+	if cntTable[corev1.PodPending] > 0 {
+		return cpb.TopologyState_TOPOLOGY_STATE_CREATING
+	}
+	return cpb.TopologyState_TOPOLOGY_STATE_UNKNOWN
+}
+
+// GetTopologyServices returns the topology information.
+func GetTopologyServices(ctx context.Context, params TopologyParams) (*cpb.ShowTopologyResponse, error) {
+	var topopb *tpb.Topology
+	var err error
+	if params.TopoName != "" {
+		topopb, err = Load(params.TopoName)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load %s: %+v", params.TopoName, err)
+		}
+	}
+
+	t, err := new(params.Kubecfg, topopb, params.TopoNewOptions...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to get topology service for %s: %+v", params.TopoName, err)
+	}
+
+	if err := t.Load(ctx); err != nil {
+		return nil, fmt.Errorf("failed to load %s: %+v", params.TopoName, err)
+	}
+
+	r, err := t.Resources(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for _, n := range t.TopologyProto().Nodes {
+		if len(n.Services) == 0 {
+			n.Services = map[uint32]*tpb.Service{}
+		}
+		// (TODO:hines): Remove type once deprecated
+		if n.Vendor == tpb.Vendor_KEYSIGHT || n.Type == tpb.Node_IXIA_TG {
+			// Add Keysight gnmi and grpc global services until
+			// they have a better registration mechanism for global
+			// services
+			if gnmiService, ok := r.Services["gnmi-service"]; ok {
+				serviceToProto(gnmiService, n.Services)
+			}
+			if grpcService, ok := r.Services["grpc-service"]; ok {
+				serviceToProto(grpcService, n.Services)
+			}
+		}
+		sName := fmt.Sprintf("service-%s", n.Name)
+		s, ok := r.Services[sName]
+		if !ok {
+			return nil, fmt.Errorf("service %s not found", sName)
+		}
+		serviceToProto(s, n.Services)
+	}
+	sMap := &sMap{}
+	for _, n := range t.Nodes() {
+		phase, _ := n.Status(ctx)
+		sMap.SetNodeState(n.Name(), phase)
+	}
+	return &cpb.ShowTopologyResponse{
+		State:    sMap.TopoState(),
+		Topology: t.TopologyProto(),
+	}, nil
 }

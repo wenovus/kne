@@ -18,17 +18,19 @@ import (
 
 	tpb "github.com/google/kne/proto/topo"
 	"github.com/google/kne/topo/node"
-	"google.golang.org/protobuf/proto"
 )
 
 func New(nodeImpl *node.Impl) (node.Node, error) {
-	cfg := defaults(nodeImpl.Proto)
-	proto.Merge(cfg, nodeImpl.Proto)
-	node.FixServices(cfg)
+	if nodeImpl == nil {
+		return nil, fmt.Errorf("nodeImpl cannot be nil")
+	}
+	if nodeImpl.Proto == nil {
+		return nil, fmt.Errorf("nodeImpl.Proto cannot be nil")
+	}
+	defaults(nodeImpl.Proto)
 	n := &Node{
 		Impl: nodeImpl,
 	}
-	proto.Merge(n.Impl.Proto, cfg)
 	return n, nil
 }
 
@@ -37,15 +39,25 @@ type Node struct {
 }
 
 func defaults(pb *tpb.Node) *tpb.Node {
-	return &tpb.Node{
-		Config: &tpb.Config{
-			Image:        "hfam/gobgp:latest",
-			Command:      []string{"/usr/local/bin/gobgpd", "-f", "/gobgp.conf", "-t", "yaml"},
-			EntryCommand: fmt.Sprintf("kubectl exec -it %s -- /bin/bash", pb.Name),
-			ConfigPath:   "/",
-			ConfigFile:   "gobgp.conf",
-		},
+	if pb.Config == nil {
+		pb.Config = &tpb.Config{}
 	}
+	if pb.Config.Image == "" {
+		pb.Config.Image = "hfam/gobgp:latest"
+	}
+	if len(pb.GetConfig().GetCommand()) == 0 {
+		pb.Config.Command = []string{"/usr/local/bin/gobgpd", "-f", "/gobgp.conf", "-t", "yaml"}
+	}
+	if pb.Config.EntryCommand == "" {
+		pb.Config.EntryCommand = fmt.Sprintf("kubectl exec -it %s -- /bin/bash", pb.Name)
+	}
+	if pb.Config.ConfigPath == "" {
+		pb.Config.ConfigPath = "/"
+	}
+	if pb.Config.ConfigFile == "" {
+		pb.Config.ConfigFile = "gobgp.conf"
+	}
+	return pb
 }
 
 func init() {

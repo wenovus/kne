@@ -28,7 +28,7 @@ func New(nodeImpl *node.Impl) (node.Node, error) {
 	if nodeImpl.Proto == nil {
 		return nil, fmt.Errorf("nodeImpl.Proto cannot be nil")
 	}
-	node.FixServices(defaults(nodeImpl.Proto))
+	defaults(nodeImpl.Proto)
 
 	n := &Node{
 		Impl: nodeImpl,
@@ -57,9 +57,8 @@ func defaults(pb *tpb.Node) *tpb.Node {
 	if pb.Services == nil {
 		pb.Services = map[uint32]*tpb.Service{
 			gnmiPort: {
-				Name:     "gnmi",
-				Inside:   gnmiPort,
-				NodePort: node.GetNextPort(),
+				Name:   "gnmi",
+				Inside: gnmiPort,
 			},
 		}
 	}
